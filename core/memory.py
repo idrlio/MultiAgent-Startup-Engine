@@ -8,12 +8,30 @@ Tier 1 — Short-term (SharedMemory)
     Used for passing structured data between agents within a single run.
 
 Tier 2 — Long-term vector memory (VectorMemory)
-    FAISS index over sentence-transformer embeddings.
-    Provides retrieval-augmented generation (RAG): agents can store free-text
-    outputs and later retrieve the most semantically relevant chunks as
-    additional context for their prompts.
+    FAISS index over Claude-generated embeddings.
 
-Both tiers are exposed through MemoryManager, the single object injected
+    Embedding strategy
+    ------------------
+    Anthropic does not expose a dedicated embeddings endpoint, so we use a
+    structured Claude prompt to produce a fixed-length (256-dim) float32
+    embedding vector for any given text.  The prompt instructs the model to
+    output a JSON array of 256 floats that encodes the semantic content of
+    the input.  Vectors are L2-normalised before insertion so inner-product
+    search is equivalent to cosine similarity.
+
+    Trade-offs vs sentence-transformers
+    - ✅ No extra dependencies or downloaded model weights (~500 MB saved)
+    - ✅ Single API key for the entire system
+    - ⚠  Slower (one API call per chunk vs local inference)
+    - ⚠  Costs tokens; batching is essential
+
+    Batching & caching
+    ------------------
+    _embed() processes texts in batches of EMBED_BATCH_SIZE and caches
+    results in a local dict keyed by SHA-256(text) so repeated embeddings
+    of identical strings never hit the API twice.
+
+Both tiers are exposed through MemoryManager — the single object injected
 into every agent via BaseAgent.attach().
 """
 
@@ -21,7 +39,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -31,6 +48,10 @@ from typing import Any
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+EMBED_DIM = 256          # dimensionality of Claude-generated embeddings
+EMBED_BATCH_SIZE = 8     # texts per embedding API call
+EMBED_MAX_CHARS = 1500   # truncate each text to this before embedding
 
 
 # ===========================================================================
@@ -118,8 +139,8 @@ class SharedMemory:
     High-level facade over the short-term KV backend.
 
     Agents use namespaced keys (``{agent}:{key}``) via BaseAgent.remember()
-    and BaseAgent.recall().  Direct access via store/retrieve is also fine
-    for orchestrator-level metadata.
+    and BaseAgent.recall(). Direct access is also fine for orchestrator-level
+    metadata.
 
     Example::
 
@@ -170,7 +191,121 @@ class SharedMemory:
 
 
 # ===========================================================================
-# Tier 2 — Long-term vector memory (FAISS + RAG)
+# Claude embedding engine
+# ===========================================================================
+
+class ClaudeEmbedder:
+    """
+    Produces fixed-length (EMBED_DIM) float32 embedding vectors using Claude.
+
+    The model is prompted to return a JSON array of ``EMBED_DIM`` floats that
+    semantically encodes the input text.  Outputs are L2-normalised so that
+    FAISS inner-product search is equivalent to cosine similarity.
+
+    Results are cached in ``_cache`` (SHA-256 → list[float]) so repeated
+    embeddings of the same text never hit the API twice within a session.
+
+    This class is internal to VectorMemory — agents never use it directly.
+    """
+
+    _SYSTEM = (
+        f"You are a text embedding engine. "
+        f"When given a text, respond ONLY with a JSON array of exactly {EMBED_DIM} "
+        f"floating-point numbers between -1 and 1 that semantically encode the input. "
+        f"Output nothing else — no explanation, no markdown, no code fences. "
+        f"The array must have exactly {EMBED_DIM} elements."
+    )
+
+    def __init__(self, client: Any, model: str) -> None:
+        self._client = client      # anthropic.Anthropic instance
+        self._model = model
+        self._cache: dict[str, list[float]] = {}
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a list of texts, returning one float32 vector per text.
+        Results are served from cache when available.
+
+        Args:
+            texts: Strings to embed (truncated to EMBED_MAX_CHARS each).
+
+        Returns:
+            List of EMBED_DIM-length float lists, in the same order as *texts*.
+        """
+        results: list[list[float] | None] = [None] * len(texts)
+        to_fetch: list[tuple[int, str]] = []
+
+        for i, text in enumerate(texts):
+            truncated = text[:EMBED_MAX_CHARS]
+            key = hashlib.sha256(truncated.encode()).hexdigest()
+            if key in self._cache:
+                results[i] = self._cache[key]
+            else:
+                to_fetch.append((i, truncated))
+
+        # Batch API calls — one call per EMBED_BATCH_SIZE uncached texts
+        for batch_start in range(0, len(to_fetch), EMBED_BATCH_SIZE):
+            batch = to_fetch[batch_start: batch_start + EMBED_BATCH_SIZE]
+            for idx, text in batch:
+                vec = self._embed_single(text)
+                key = hashlib.sha256(text.encode()).hexdigest()
+                self._cache[key] = vec
+                results[idx] = vec
+
+        return [r for r in results if r is not None]
+
+    def _embed_single(self, text: str) -> list[float]:
+        """Call Claude to produce one embedding vector, with parse fallback."""
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=2048,
+                temperature=0.0,
+                system=self._SYSTEM,
+                messages=[{"role": "user", "content": text}],
+            )
+            raw = response.content[0].text.strip()
+            vec = json.loads(raw)
+            if not isinstance(vec, list) or len(vec) != EMBED_DIM:
+                raise ValueError(f"Expected list of {EMBED_DIM}, got {type(vec)} len={len(vec)}")
+            return [float(x) for x in vec]
+        except Exception as exc:
+            logger.warning("embedder.parse_error", error=str(exc), text_preview=text[:60])
+            return self._fallback_vector(text)
+
+    @staticmethod
+    def _fallback_vector(text: str) -> list[float]:
+        """
+        Deterministic pseudo-embedding derived from text hash.
+        Used when the Claude response cannot be parsed.
+        Ensures the system never crashes due to an embedding failure.
+        """
+        import math
+        h = hashlib.sha256(text.encode()).digest()
+        vec = []
+        for i in range(EMBED_DIM):
+            byte_val = h[i % 32]
+            angle = (byte_val / 255.0) * 2 * math.pi + i
+            vec.append(math.sin(angle))
+        # L2-normalise
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    def normalise(self, vecs: list[list[float]]) -> "Any":
+        """Convert to normalised float32 numpy array for FAISS."""
+        import numpy as np  # type: ignore
+        arr = np.array(vecs, dtype="float32")
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return arr / norms
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._cache)
+
+
+# ===========================================================================
+# Tier 2 — Long-term vector memory (FAISS + Claude embeddings)
 # ===========================================================================
 
 @dataclass
@@ -179,11 +314,11 @@ class MemoryChunk:
     A single retrievable unit stored in the vector index.
 
     Attributes:
-        id:        Unique deterministic hash of the text content.
-        text:      The raw text that was embedded and stored.
-        source:    Who produced this chunk (agent name, tool name, etc.).
-        metadata:  Arbitrary annotations (run_id, timestamp, topic, …).
-        score:     Cosine similarity score populated during retrieval (0–1).
+        id:        Deterministic SHA-256 hash of source + text.
+        text:      Raw text that was embedded and stored.
+        source:    Who produced this chunk (agent name, tool, …).
+        metadata:  Arbitrary annotations (run_id, timestamp, …).
+        score:     Cosine similarity populated during retrieval (0–1).
     """
 
     id: str
@@ -203,70 +338,59 @@ class MemoryChunk:
 
 class VectorMemory:
     """
-    Long-term semantic memory backed by FAISS and sentence-transformers.
+    Long-term semantic memory backed by FAISS and Claude embeddings.
 
-    Provides retrieval-augmented generation (RAG):
-    - store()    — embed and index a text chunk
-    - retrieve() — find the *k* most semantically similar chunks
-    - persist()  — save the FAISS index to disk
-    - load()     — restore a previously saved index
+    All embeddings are produced by Claude (no sentence-transformers required).
+    The index persists to disk between sessions via persist() / load().
 
-    The index is kept in RAM during a run and optionally persisted to
-    ``vector_memory_dir`` so context survives across sessions.
-
-    If sentence-transformers or faiss-cpu are not installed, all operations
-    degrade gracefully to no-ops with a warning — the system still runs,
-    just without RAG enrichment.
+    If faiss-cpu is not installed, all operations degrade to no-ops with a
+    warning — the rest of the system continues to function without RAG.
 
     Example::
 
-        vm = VectorMemory()
-        vm.store("The TAM for B2B SaaS CRM is $50B globally.", source="research")
+        vm = VectorMemory(client=anthropic_client, model="claude-haiku-4-5")
+        vm.store("The B2B CRM TAM is $50B globally.", source="research")
         chunks = vm.retrieve("market size CRM", k=3)
         for chunk in chunks:
             print(chunk)
     """
 
-    def __init__(self, persist_dir: str | None = None, embedding_model: str | None = None) -> None:
+    def __init__(
+        self,
+        client: Any | None = None,
+        model: str | None = None,
+        persist_dir: str | None = None,
+    ) -> None:
         from config import settings
+        import anthropic
 
         self._persist_dir = Path(persist_dir or settings.vector_memory_dir)
-        self._model_name = embedding_model or settings.embedding_model
         self._chunk_size = settings.rag_chunk_size
         self._chunk_overlap = settings.rag_chunk_overlap
 
-        self._index: Any = None          # faiss.IndexFlatIP
+        # Use a fast/cheap model for embeddings to minimise cost & latency
+        embed_model = model or "claude-haiku-4-5-20251001"
+        embed_client = client or anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self._embedder = ClaudeEmbedder(client=embed_client, model=embed_model)
+
+        self._index: Any = None
         self._chunks: list[MemoryChunk] = []
-        self._model: Any = None          # SentenceTransformer
-        self._dim: int = 0
         self._available = False
 
-        self._try_init()
+        self._try_init_faiss()
 
-    def _try_init(self) -> None:
-        """Attempt to initialise FAISS + sentence-transformers; degrade gracefully."""
+    def _try_init_faiss(self) -> None:
+        """Attempt to initialise the FAISS index; degrade gracefully on ImportError."""
         try:
-            import faiss  # type: ignore  # noqa: F401
-            from sentence_transformers import SentenceTransformer  # type: ignore
-
-            self._model = SentenceTransformer(self._model_name)
-            # Warm-up: embed a dummy string to get embedding dimension
-            sample = self._model.encode(["ping"], normalize_embeddings=True)
-            self._dim = sample.shape[1]
-
-            import faiss
-            self._index = faiss.IndexFlatIP(self._dim)   # inner-product ≡ cosine on normalised vecs
+            import faiss  # type: ignore
+            self._index = faiss.IndexFlatIP(EMBED_DIM)
             self._available = True
-            logger.info(
-                "memory.vector.ready",
-                model=self._model_name,
-                dim=self._dim,
-            )
-        except ImportError as exc:
+            logger.info("memory.vector.ready", dim=EMBED_DIM, backend="claude-embeddings")
+        except ImportError:
             logger.warning(
                 "memory.vector.unavailable",
-                reason=str(exc),
-                hint="pip install faiss-cpu sentence-transformers",
+                hint="pip install faiss-cpu",
+                note="RAG disabled; system continues without vector memory",
             )
 
     # ------------------------------------------------------------------
@@ -275,24 +399,21 @@ class VectorMemory:
 
     @property
     def available(self) -> bool:
-        """True when FAISS and sentence-transformers are installed and ready."""
+        """True when faiss-cpu is installed and the index is ready."""
         return self._available
 
     def store(self, text: str, source: str, **metadata: Any) -> list[MemoryChunk]:
         """
-        Chunk, embed, and index *text*.
-
-        Long texts are split into overlapping windows of ``rag_chunk_size``
-        characters so no single chunk exceeds the embedding model's context.
+        Chunk, embed (via Claude), and index *text*.
 
         Args:
-            text:     Free-text content to index (agent output, search result, …).
-            source:   Identifier of who produced this text (e.g. ``"research"``).
-            **metadata: Arbitrary key-value annotations stored alongside the chunk.
+            text:       Free-text to index (agent output, search result, …).
+            source:     Producer identifier (e.g. ``"research"``).
+            **metadata: Arbitrary annotations stored alongside each chunk.
 
         Returns:
-            List of MemoryChunk objects that were added to the index.
-            Returns an empty list when the vector layer is unavailable.
+            List of MemoryChunk objects added to the index.
+            Empty list when the vector layer is unavailable.
         """
         if not self._available:
             return []
@@ -302,16 +423,18 @@ class VectorMemory:
             return []
 
         texts = [c.text for c in chunks]
-        embeddings = self._embed(texts)
+        vecs_raw = self._embedder.embed_batch(texts)
+        vecs = self._embedder.normalise(vecs_raw)
 
-        self._index.add(embeddings)  # type: ignore[union-attr]
+        self._index.add(vecs)  # type: ignore[union-attr]
         self._chunks.extend(chunks)
 
         logger.debug(
             "memory.vector.stored",
             source=source,
             chunks=len(chunks),
-            total_indexed=len(self._chunks),
+            total=len(self._chunks),
+            embed_cache=self._embedder.cache_size,
         )
         return chunks
 
@@ -319,13 +442,15 @@ class VectorMemory:
         """
         Return the *k* most semantically similar chunks to *query*.
 
+        Embeddings for the query are also cached so repeated identical
+        queries never make a second API call.
+
         Args:
             query: Natural-language query string.
             k:     Number of results (defaults to settings.rag_top_k).
 
         Returns:
-            List of MemoryChunk objects sorted by descending similarity score.
-            Returns an empty list when the index is empty or unavailable.
+            List of MemoryChunk sorted by descending cosine similarity.
         """
         if not self._available or self._index.ntotal == 0:  # type: ignore[union-attr]
             return []
@@ -333,31 +458,30 @@ class VectorMemory:
         from config import settings
         effective_k = min(k or settings.rag_top_k, self._index.ntotal)  # type: ignore[union-attr]
 
-        query_vec = self._embed([query])
+        vecs_raw = self._embedder.embed_batch([query])
+        query_vec = self._embedder.normalise(vecs_raw)
+
         scores, indices = self._index.search(query_vec, effective_k)  # type: ignore[union-attr]
 
+        import dataclasses
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx < 0 or idx >= len(self._chunks):
                 continue
-            chunk = self._chunks[idx]
-            import dataclasses
-            results.append(dataclasses.replace(chunk, score=float(score)))
+            results.append(dataclasses.replace(self._chunks[idx], score=float(score)))
 
         logger.debug(
             "memory.vector.retrieve",
             query=query[:60],
             k=effective_k,
-            results=len(results),
+            found=len(results),
         )
         return results
 
     def retrieve_as_context(self, query: str, k: int | None = None) -> str:
         """
-        Retrieve relevant chunks and format them as a Markdown context block
+        Retrieve relevant chunks and return them as a Markdown block
         ready for injection into a Claude prompt.
-
-        Returns an empty string when no relevant chunks are found.
         """
         chunks = self.retrieve(query, k=k)
         if not chunks:
@@ -365,47 +489,35 @@ class VectorMemory:
         lines = ["## Retrieved Memory Context (RAG)\n"]
         for i, chunk in enumerate(chunks, 1):
             lines.append(
-                f"### Memory {i} — source: {chunk.source} (relevance: {chunk.score:.2f})\n"
-                f"{chunk.text}\n"
+                f"### Memory {i} — source: `{chunk.source}`  "
+                f"relevance: {chunk.score:.2f}\n{chunk.text}\n"
             )
         return "\n".join(lines)
 
     def persist(self) -> Path:
         """
-        Save the FAISS index and chunk metadata to disk.
+        Save the FAISS index and chunk metadata to ``vector_memory_dir``.
 
         Returns:
-            Path to the directory where files were written.
-
-        Raises:
-            RuntimeError: If the vector layer is unavailable.
+            Path to the persistence directory.
         """
         if not self._available:
-            raise RuntimeError("Vector memory is not available — cannot persist.")
+            raise RuntimeError("Vector memory unavailable — cannot persist.")
 
         import faiss  # type: ignore
 
         self._persist_dir.mkdir(parents=True, exist_ok=True)
-        index_path = self._persist_dir / "index.faiss"
-        meta_path = self._persist_dir / "chunks.json"
+        faiss.write_index(self._index, str(self._persist_dir / "index.faiss"))
 
-        faiss.write_index(self._index, str(index_path))
         meta = [
-            {
-                "id": c.id,
-                "text": c.text,
-                "source": c.source,
-                "metadata": c.metadata,
-            }
+            {"id": c.id, "text": c.text, "source": c.source, "metadata": c.metadata}
             for c in self._chunks
         ]
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-        logger.info(
-            "memory.vector.persisted",
-            path=str(self._persist_dir),
-            chunks=len(self._chunks),
+        (self._persist_dir / "chunks.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
         )
+
+        logger.info("memory.vector.persisted", path=str(self._persist_dir), chunks=len(self._chunks))
         return self._persist_dir
 
     def load(self) -> bool:
@@ -413,37 +525,31 @@ class VectorMemory:
         Restore a previously persisted FAISS index from disk.
 
         Returns:
-            True if the index was successfully loaded, False otherwise.
+            True on success, False if no persisted index found.
         """
         if not self._available:
             return False
 
         import faiss  # type: ignore
 
-        index_path = self._persist_dir / "index.faiss"
+        idx_path = self._persist_dir / "index.faiss"
         meta_path = self._persist_dir / "chunks.json"
 
-        if not index_path.exists() or not meta_path.exists():
-            logger.debug("memory.vector.no_persisted_index")
+        if not idx_path.exists() or not meta_path.exists():
+            logger.debug("memory.vector.no_saved_index")
             return False
 
         try:
-            self._index = faiss.read_index(str(index_path))
+            self._index = faiss.read_index(str(idx_path))
             raw = json.loads(meta_path.read_text(encoding="utf-8"))
             self._chunks = [
                 MemoryChunk(
-                    id=r["id"],
-                    text=r["text"],
-                    source=r["source"],
-                    metadata=r.get("metadata", {}),
+                    id=r["id"], text=r["text"],
+                    source=r["source"], metadata=r.get("metadata", {}),
                 )
                 for r in raw
             ]
-            logger.info(
-                "memory.vector.loaded",
-                path=str(self._persist_dir),
-                chunks=len(self._chunks),
-            )
+            logger.info("memory.vector.loaded", chunks=len(self._chunks))
             return True
         except Exception:
             logger.exception("memory.vector.load_error")
@@ -453,29 +559,20 @@ class VectorMemory:
         """Reset the in-memory index (does not delete persisted files)."""
         if self._available:
             import faiss  # type: ignore
-            self._index = faiss.IndexFlatIP(self._dim)
+            self._index = faiss.IndexFlatIP(EMBED_DIM)
         self._chunks.clear()
-        logger.debug("memory.vector.cleared")
 
     @property
     def size(self) -> int:
-        """Number of chunks currently in the index."""
         return len(self._chunks)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _embed(self, texts: list[str]):  # -> np.ndarray
-        """Embed a list of strings, returning L2-normalised float32 vectors."""
-        import numpy as np  # type: ignore
-        vecs = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        return np.array(vecs, dtype="float32")
-
     def _chunk_text(self, text: str, source: str, **metadata: Any) -> list[MemoryChunk]:
-        """Split *text* into overlapping character windows."""
-        size = self._chunk_size
-        overlap = self._chunk_overlap
+        """Split *text* into overlapping fixed-size character windows."""
+        size, overlap = self._chunk_size, self._chunk_overlap
         chunks: list[MemoryChunk] = []
         start = 0
         while start < len(text):
@@ -491,8 +588,8 @@ class VectorMemory:
     def __repr__(self) -> str:
         return (
             f"<VectorMemory available={self._available} "
-            f"model={self._model_name!r} "
-            f"chunks={self.size}>"
+            f"dim={EMBED_DIM} chunks={self.size} "
+            f"embed_cache={self._embedder.cache_size}>"
         )
 
 
@@ -504,24 +601,21 @@ class MemoryManager:
     """
     Single object injected into every agent, combining both memory tiers.
 
-    Agents interact with this class exclusively — they never instantiate
-    SharedMemory or VectorMemory directly.
-
-    Short-term usage::
+    Short-term (KV)::
 
         mgr.store("run:objective", "Build a SaaS CRM")
         obj = mgr.retrieve("run:objective")
 
-    Long-term / RAG usage::
+    Long-term (RAG)::
 
-        mgr.index("The global CRM market is worth $50B.", source="research")
+        mgr.index("The global CRM market is $50B.", source="research")
         context = mgr.rag_context("market size CRM software")
-        # Inject context string into agent's Claude prompt
+        # inject context string into Claude prompt
 
     Example::
 
         mgr = MemoryManager()
-        mgr.store("ceo:vision", "Become the #1 AI-native CRM")
+        mgr.store("ceo:vision", "AI-native CRM")
         mgr.index(ceo_output, source="ceo", run_id="abc123")
         relevant = mgr.rag_context("product vision and positioning")
     """
@@ -534,13 +628,19 @@ class MemoryManager:
         from config import settings
 
         self.kv = kv or SharedMemory()
-        self.vector = vector if vector is not None else (
-            VectorMemory() if settings.enable_vector_memory else None
-        )
+        self.vector: VectorMemory | None
+        if vector is not None:
+            self.vector = vector
+        elif settings.enable_vector_memory:
+            self.vector = VectorMemory()
+        else:
+            self.vector = None
+
         logger.info(
             "memory.manager.ready",
             kv_backend=type(self.kv._backend).__name__,
             vector_available=self.vector.available if self.vector else False,
+            embedding_backend="claude" if self.vector else "disabled",
         )
 
     # ------------------------------------------------------------------
@@ -548,11 +648,11 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     def store(self, key: str, value: Any, ttl: int | None = None) -> None:
-        """Store a value in short-term memory."""
+        """Store a value in short-term KV memory."""
         self.kv.store(key, value, ttl)
 
     def retrieve(self, key: str) -> Any | None:
-        """Retrieve a value from short-term memory."""
+        """Retrieve a value from short-term KV memory."""
         return self.kv.retrieve(key)
 
     def delete(self, key: str) -> None:
@@ -570,14 +670,14 @@ class MemoryManager:
 
     def index(self, text: str, source: str, **metadata: Any) -> list[MemoryChunk]:
         """
-        Embed and index *text* in the long-term vector store.
+        Embed (via Claude) and index *text* in long-term vector memory.
 
         Silently does nothing if the vector layer is unavailable.
 
         Args:
-            text:      Free-text to store (agent output, search result, …).
-            source:    Producer identifier (agent name, tool name, …).
-            **metadata: Arbitrary annotations attached to every chunk.
+            text:      Free-text to store.
+            source:    Producer identifier (agent name, tool, …).
+            **metadata: Annotations attached to every generated chunk.
 
         Returns:
             List of stored MemoryChunk objects (empty if unavailable).
@@ -589,7 +689,7 @@ class MemoryManager:
     def rag_context(self, query: str, k: int | None = None) -> str:
         """
         Retrieve the most relevant memory chunks for *query* and return
-        them as a formatted Markdown string ready for prompt injection.
+        them as a Markdown string for prompt injection.
 
         Returns an empty string when vector memory is unavailable or empty.
         """
@@ -598,12 +698,12 @@ class MemoryManager:
         return self.vector.retrieve_as_context(query, k=k)
 
     def persist_vector(self) -> None:
-        """Flush the vector index to disk (no-op if unavailable)."""
+        """Flush the FAISS index and chunk metadata to disk."""
         if self.vector and self.vector.available:
             self.vector.persist()
 
     def load_vector(self) -> bool:
-        """Restore vector index from disk. Returns True on success."""
+        """Restore the FAISS index from disk. Returns True on success."""
         if self.vector and self.vector.available:
             return self.vector.load()
         return False

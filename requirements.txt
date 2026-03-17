@@ -2,25 +2,23 @@
 # AgentForge — dependencies
 # ==============================================================================
 
-# Core AI
+# Core AI (embeddings + agent calls — single API key for everything)
 anthropic>=0.40.0
+
+# Vector Memory / RAG (FAISS only — embeddings come from Claude)
+faiss-cpu>=1.8.0
+numpy>=1.26.0
 
 # Web Search
 tavily-python>=0.5.0
-
-# Vector Memory / RAG
-faiss-cpu>=1.8.0
-sentence-transformers>=3.0.0
-numpy>=1.26.0
 
 # Environment & Config
 python-dotenv>=1.0.0
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
 
-# Async & HTTP
+# HTTP
 httpx>=0.27.0
-anyio>=4.4.0
 
 # Retry / resilience
 tenacity>=8.3.0
