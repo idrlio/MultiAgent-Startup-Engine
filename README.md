@@ -202,3 +202,61 @@ Each run creates a timestamped directory under `.artifacts/`:
 ## License
 
 MIT © 2025 AgentForge Contributors
+
+---
+
+## UI — Web Interface
+
+AgentForge ships with a full web UI: a **React** frontend + **FastAPI** backend with real-time streaming via Server-Sent Events.
+
+### Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, Vite, react-markdown |
+| Backend  | FastAPI, Uvicorn |
+| Streaming | Server-Sent Events (SSE) — real-time pipeline updates |
+| Fonts | DM Sans + DM Mono |
+
+### Starting the UI
+
+```bash
+# One command — starts both backend and frontend
+./start.sh          # macOS / Linux
+start.bat           # Windows
+```
+
+Then open **http://localhost:5173** in your browser.
+
+### Manual start (if preferred)
+
+```bash
+# Terminal 1 — backend
+PYTHONPATH=. uvicorn ui.backend.main:app --reload --port 8000
+
+# Terminal 2 — frontend
+cd ui/frontend
+npm install
+npm run dev
+```
+
+### UI Pages
+
+| Page | What it shows |
+|---|---|
+| **Workspace** | Objective input · live pipeline progress · agent output tabs · critic panel |
+| **History** | All past runs with status, duration, steps, feedback rounds |
+| **Memory** | KV keys · FAISS chunk count · embedding cache · RAG explanation |
+| **Settings** | Read-only view of current .env configuration |
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/runs/stream` | Start a run — returns SSE stream |
+| `GET`  | `/api/runs` | List all runs |
+| `GET`  | `/api/runs/{id}` | Get full run detail |
+| `DELETE` | `/api/runs/{id}` | Delete a run from history |
+| `GET`  | `/api/settings` | Current configuration |
+| `GET`  | `/api/memory/stats` | Live memory statistics |
+| `GET`  | `/health` | Health check |
