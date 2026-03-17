@@ -1,11 +1,17 @@
 """
 tools/web_search.py
-Web search integration via Tavily API.
-Provides a clean interface for agents to query the web.
+===================
+Web search tool with Tavily backend and automatic mock fallback.
+
+- If TAVILY_API_KEY is set: calls the real Tavily API.
+- If not set (or on API error): falls back to a deterministic mock that
+  returns realistic-looking placeholder results so the rest of the system
+  can be exercised without an API key.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import structlog
@@ -16,6 +22,7 @@ logger = structlog.get_logger(__name__)
 
 @dataclass
 class SearchResult:
+    """A single search result."""
     title: str
     url: str
     content: str
@@ -25,59 +32,74 @@ class SearchResult:
         return f"[{self.score:.2f}] {self.title}\n{self.url}\n{self.content[:300]}"
 
 
-class WebSearch:
+class MockSearchBackend:
     """
-    Thin wrapper around the Tavily search API.
-
-    Usage:
-        searcher = WebSearch()
-        results = searcher.search("AI startup tools 2025", max_results=5)
-        for r in results:
-            print(r)
+    Deterministic mock search backend — no API key required.
+    Returns plausible placeholder results derived from the query hash.
+    Useful for local development and CI.
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
-        from config import settings
+    _TEMPLATES = [
+        ("{query} Market Report 2025",
+         "https://example-research.com/{slug}",
+         "The {query} market is projected to reach $12.4B by 2027, "
+         "growing at a CAGR of 18.3%. Key players include incumbents and "
+         "emerging AI-native startups competing on automation and integrations."),
+        ("Top {query} Competitors & Alternatives",
+         "https://g2.com/categories/{slug}",
+         "Leading solutions in the {query} space include established SaaS "
+         "platforms and newer entrants. Feature differentiation centres on "
+         "AI capabilities, pricing model, and ecosystem integrations."),
+        ("{query} Industry Trends 2025",
+         "https://example-insights.com/{slug}-trends",
+         "Three macro trends are reshaping {query}: (1) AI-first workflows "
+         "replacing manual processes, (2) API-first architectures enabling "
+         "composable stacks, (3) usage-based pricing replacing seat licences."),
+        ("How to build a {query} startup",
+         "https://techcrunch.com/{slug}-startup-guide",
+         "Founders entering the {query} space should focus on a narrow ICP, "
+         "ship a functional MVP within 8 weeks, and validate willingness-to-pay "
+         "before expanding the feature set."),
+        ("{query} Venture Capital Funding Landscape",
+         "https://crunchbase.com/discover/{slug}",
+         "VC investment in {query} totalled $3.2B in 2024. Seed rounds "
+         "average $1.8M; Series A averages $12M. Investors prioritise "
+         "retention metrics, NRR, and AI differentiation."),
+    ]
 
-        key = api_key or settings.tavily_api_key
-        if not key:
-            raise ValueError("TAVILY_API_KEY is not set. Add it to your .env file.")
+    def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+        slug = query.lower().replace(" ", "-")[:30]
+        h = int(hashlib.md5(query.encode()).hexdigest(), 16)
+        results = []
+        for i, (title_t, url_t, content_t) in enumerate(self._TEMPLATES[:max_results]):
+            score = round(0.95 - i * 0.07, 2)
+            results.append(SearchResult(
+                title=title_t.format(query=query.title(), slug=slug),
+                url=url_t.format(slug=slug),
+                content=content_t.format(query=query.lower()),
+                score=score,
+            ))
+        return results
 
+
+class TavilyBackend:
+    """Live Tavily API backend."""
+
+    def __init__(self, api_key: str) -> None:
         try:
             from tavily import TavilyClient  # type: ignore
-
-            self._client = TavilyClient(api_key=key)
+            self._client = TavilyClient(api_key=api_key)
         except ImportError as exc:
-            raise RuntimeError("Install tavily: pip install tavily-python") from exc
-
-        logger.info("web_search.ready")
+            raise RuntimeError("pip install tavily-python") from exc
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def search(
-        self,
-        query: str,
-        max_results: int = 5,
-        search_depth: str = "basic",
-    ) -> list[SearchResult]:
-        """
-        Execute a web search.
-
-        Args:
-            query:        Search query string.
-            max_results:  Number of results to return (max 10).
-            search_depth: "basic" (fast) or "advanced" (thorough).
-
-        Returns:
-            List of SearchResult objects sorted by relevance score.
-        """
-        logger.info("web_search.query", query=query, max_results=max_results)
+    def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         response = self._client.search(
             query=query,
             max_results=min(max_results, 10),
-            search_depth=search_depth,
+            search_depth="basic",
         )
-
-        results = [
+        return [
             SearchResult(
                 title=r.get("title", ""),
                 url=r.get("url", ""),
@@ -86,15 +108,77 @@ class WebSearch:
             )
             for r in response.get("results", [])
         ]
-        logger.info("web_search.results", count=len(results))
+
+
+class WebSearch:
+    """
+    Unified web search interface.
+
+    Automatically uses TavilyBackend when TAVILY_API_KEY is configured,
+    and falls back to MockSearchBackend otherwise.
+
+    Usage::
+
+        ws = WebSearch()
+        results = ws.search("B2B SaaS CRM market size", max_results=5)
+        for r in results:
+            print(r)
+
+        # Get pre-formatted text block for prompt injection
+        block = ws.search_as_context("competitor analysis CRM tools")
+    """
+
+    def __init__(self) -> None:
+        from config import settings
+        if settings.tavily_api_key:
+            try:
+                self._backend = TavilyBackend(settings.tavily_api_key)
+                self._using_mock = False
+                logger.info("web_search.backend", backend="tavily")
+            except Exception as exc:
+                logger.warning("web_search.tavily_init_failed", error=str(exc))
+                self._backend = MockSearchBackend()
+                self._using_mock = True
+        else:
+            self._backend = MockSearchBackend()
+            self._using_mock = True
+            logger.info("web_search.backend", backend="mock")
+
+    def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+        """
+        Search the web (or mock) for *query*.
+
+        Args:
+            query:       Search query string.
+            max_results: Maximum number of results (1–10).
+
+        Returns:
+            List of SearchResult sorted by relevance.
+        """
+        logger.info("web_search.query", query=query, max_results=max_results, mock=self._using_mock)
+        results = self._backend.search(query, max_results=max_results)
+        logger.info("web_search.done", returned=len(results))
         return results
 
-    def search_as_text(self, query: str, max_results: int = 5) -> str:
-        """Return search results as a formatted string block."""
+    def search_as_context(self, query: str, max_results: int = 5) -> str:
+        """
+        Return search results as a Markdown context block for prompt injection.
+
+        Returns an empty string when no results are found.
+        """
         results = self.search(query, max_results=max_results)
         if not results:
-            return "No results found."
-        lines = [f"Search results for: {query!r}\n"]
+            return ""
+        source = "mock" if self._using_mock else "web"
+        lines = [f"## Web Search Results [{source}] — Query: {query!r}\n"]
         for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r.title}\n   {r.url}\n   {r.content[:200]}\n")
+            lines.append(
+                f"### Result {i}: {r.title}\n"
+                f"Source: {r.url}  (relevance: {r.score:.2f})\n"
+                f"{r.content}\n"
+            )
         return "\n".join(lines)
+
+    @property
+    def using_mock(self) -> bool:
+        return self._using_mock
