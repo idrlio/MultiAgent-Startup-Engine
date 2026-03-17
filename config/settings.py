@@ -1,0 +1,42 @@
+"""
+config/settings.py
+Central configuration loaded from environment variables.
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
+    # Anthropic
+    anthropic_api_key: str = Field(..., description="Anthropic API key")
+    model_name: str = Field("claude-opus-4-5", description="Claude model to use")
+    max_tokens: int = Field(4096, description="Max tokens per completion")
+    temperature: float = Field(0.7, ge=0.0, le=1.0)
+
+    # Web search
+    tavily_api_key: str = Field("", description="Tavily API key for web search")
+
+    # Orchestration
+    max_iterations: int = Field(10, ge=1, le=50)
+    agent_timeout_seconds: int = Field(120, ge=10)
+    enable_critic: bool = Field(True)
+
+    # Memory & storage
+    memory_backend: str = Field("diskcache", pattern="^(diskcache|in_memory)$")
+    memory_dir: str = Field(".cache/memory")
+    artifacts_dir: str = Field(".artifacts")
+
+    # Logging
+    log_level: str = Field("INFO", pattern="^(DEBUG|INFO|WARNING|ERROR)$")
+    log_format: str = Field("console", pattern="^(json|console)$")
+
+
+# Singleton — import this everywhere
+settings = Settings()  # type: ignore[call-arg]
