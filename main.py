@@ -27,16 +27,12 @@ from agents import (
     ProductAgent,
     ResearchAgent,
 )
-from core import Orchestrator, SharedMemory, MessageBus
+from core import Orchestrator, SharedMemory, MessageBus, Workflow, RunStatus
 from tools import FileManager
 
 console = Console()
 logger = structlog.get_logger(__name__)
 
-
-# --------------------------------------------------------------------------- #
-# Logging setup                                                                #
-# --------------------------------------------------------------------------- #
 
 def _configure_logging(log_level: str, log_format: str) -> None:
     import logging
@@ -47,18 +43,15 @@ def _configure_logging(log_level: str, log_format: str) -> None:
         level=getattr(logging, log_level.upper(), logging.INFO),
         stream=sys.stdout,
     )
-
     processors = [
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),
     ]
-
     if log_format == "json":
         processors.append(structlog.processors.JSONRenderer())
     else:
         processors.append(structlog.dev.ConsoleRenderer())
-
     structlog.configure(
         processors=processors,  # type: ignore[arg-type]
         wrapper_class=structlog.stdlib.BoundLogger,
@@ -66,44 +59,16 @@ def _configure_logging(log_level: str, log_format: str) -> None:
     )
 
 
-# --------------------------------------------------------------------------- #
-# CLI                                                                          #
-# --------------------------------------------------------------------------- #
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="AI Startup Engine — autonomous multi-agent startup simulator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--objective",
-        type=str,
-        default="",
-        help="High-level startup objective (leave blank to be prompted interactively)",
-    )
-    parser.add_argument(
-        "--no-critic",
-        action="store_true",
-        help="Skip the critic agent",
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=None,
-        help="Override MAX_ITERATIONS from settings",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Override artifacts output directory",
-    )
+    parser.add_argument("--objective", type=str, default="")
+    parser.add_argument("--no-critic", action="store_true")
+    parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
     return parser.parse_args()
 
-
-# --------------------------------------------------------------------------- #
-# Main                                                                         #
-# --------------------------------------------------------------------------- #
 
 def main() -> None:
     from config import settings
@@ -111,13 +76,11 @@ def main() -> None:
     args = _parse_args()
     _configure_logging(settings.log_level, settings.log_format)
 
-    # Apply CLI overrides
     if args.iterations:
         settings.max_iterations = args.iterations
     if args.no_critic:
         settings.enable_critic = False
 
-    # Banner
     console.print(
         Panel.fit(
             "[bold cyan]🚀 AI Startup Engine[/bold cyan]\n"
@@ -126,12 +89,9 @@ def main() -> None:
         )
     )
 
-    # Objective
     objective = args.objective.strip()
     if not objective:
-        objective = console.input(
-            "\n[bold yellow]Enter your startup objective:[/bold yellow] "
-        ).strip()
+        objective = console.input("\n[bold yellow]Enter your startup objective:[/bold yellow] ").strip()
 
     if not objective:
         console.print("[red]Error:[/red] No objective provided. Exiting.")
@@ -139,42 +99,64 @@ def main() -> None:
 
     console.print(f"\n[bold]Objective:[/bold] {objective}\n")
 
-    # Wire up components
+    # Wire up infrastructure
     memory = SharedMemory()
     bus = MessageBus()
     orchestrator = Orchestrator(memory=memory, bus=bus)
     file_manager = FileManager(artifacts_dir=args.output_dir)
 
     # Register agents
-    for AgentClass in [ResearchAgent, CEOAgent, ProductAgent, EngineerAgent, MarketingAgent, CriticAgent]:
+    agent_classes = [ResearchAgent, CEOAgent, ProductAgent, EngineerAgent, MarketingAgent]
+    if settings.enable_critic:
+        agent_classes.append(CriticAgent)
+
+    for AgentClass in agent_classes:
         orchestrator.register(AgentClass())
 
-    # Run with progress indicator
-    results: dict[str, str] = {}
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
+    # Build workflow
+    pipeline = [a().name for a in agent_classes]
+    # Re-register is avoided: get names via class attribute
+    pipeline = [AgentClass.name for AgentClass in agent_classes]
+    workflow = Workflow.linear("startup-engine", pipeline)
+
+    # Execute
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  console=console, transient=True) as progress:
         task = progress.add_task("Running agents...", total=None)
-        results = orchestrator.run(objective=objective)
+        record = orchestrator.run(objective=objective, workflow=workflow)
         progress.update(task, description="Done.")
 
     # Display results
-    console.print("\n")
-    for agent_name, output in results.items():
-        console.print(Panel(Markdown(output), title=f"[bold]{agent_name.upper()}[/bold]", border_style="green"))
-        file_manager.save_artifact(agent_name, f"{agent_name}.md", output)
+    console.print()
+    for agent_name, result in record.results.items():
+        border = "green" if result.success else "red"
+        console.print(Panel(
+            Markdown(result.content),
+            title=f"[bold]{agent_name.upper()}[/bold]",
+            border_style=border,
+        ))
+        file_manager.save_artifact(agent_name, f"{agent_name}.md", result.content)
 
-    # Export consolidated report
-    report_path = file_manager.export_report(results, objective=objective)
-    file_manager.save_json("results.json", {"objective": objective, "results": results})
-
+    # Summary
+    status_color = "green" if record.status == RunStatus.COMPLETED else "yellow"
     console.print(
-        f"\n[bold green]✓ Complete![/bold green] "
-        f"Report saved to [cyan]{report_path}[/cyan]\n"
+        f"\n[bold {status_color}]Run {record.status.value.upper()}[/bold {status_color}] "
+        f"— {len(record.succeeded_steps)}/{len(record.steps)} steps succeeded "
+        f"in {record.duration_s:.1f}s"
     )
+
+    # Export artefacts
+    raw_results = {name: r.content for name, r in record.results.items()}
+    report_path = file_manager.export_report(raw_results, objective=objective)
+    file_manager.save_json("results.json", {
+        "run_id": record.run_id,
+        "objective": objective,
+        "status": record.status.value,
+        "duration_s": record.duration_s,
+        "results": raw_results,
+    })
+
+    console.print(f"Report saved to [cyan]{report_path}[/cyan]\n")
 
 
 if __name__ == "__main__":

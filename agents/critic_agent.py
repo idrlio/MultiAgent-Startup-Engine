@@ -1,11 +1,11 @@
 """
 agents/critic_agent.py
-Red-teams all prior agent outputs and identifies weaknesses, gaps, and risks.
+Red-teams all prior agent outputs and identifies weaknesses and risks.
 """
 
 from __future__ import annotations
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import AgentResult, BaseAgent
 
 
 class CriticAgent(BaseAgent):
@@ -21,24 +21,26 @@ Your job is to review all prior agent outputs and:
 - Provide an overall confidence score (1-10) with justification
 
 Structure your output as:
-1. Critical Assumptions Being Made (and whether each is validated)
+1. Critical Assumptions Being Made (validated or not)
 2. Top 5 Startup Risks (ranked by severity)
 3. Strategy Gaps
 4. Recommended Improvements
-5. Overall Confidence Score & Verdict
+5. Overall Confidence Score and Verdict
+Be honest, rigorous, and constructive (400-500 words)."""
 
-Be honest, rigorous, and constructive — not destructive (400-500 words).
-"""
+    def run(self, objective: str, context: dict[str, AgentResult]) -> AgentResult:
+        """
+        Execute the critic agent task.
 
-    def run(self, objective: str, context: dict[str, str]) -> str:
-        ctx = self._build_context_block(context)
-        prompt = f"""Startup Objective: {objective}
+        Args:
+            objective: The top-level startup goal.
+            context:   Results from prior agents in the pipeline.
 
-{ctx}
-
-Red-team and critique all prior outputs now. Be rigorous."""
-
-        self._log.info("critic.running")
-        result = self._call_claude(prompt)
-        self._log.info("critic.done")
-        return result
+        Returns:
+            AgentResult containing the critic output.
+        """
+        self._log.info("critic.run.start")
+        prompt = self._build_prompt(objective, context)
+        content = self._call_claude(prompt)
+        self._log.info("critic.run.complete", content_chars=len(content))
+        return AgentResult(agent=self.name, content=content)

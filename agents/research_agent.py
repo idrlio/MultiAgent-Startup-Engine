@@ -5,7 +5,7 @@ Gathers market research, competitor analysis, and trend data.
 
 from __future__ import annotations
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import AgentResult, BaseAgent
 
 
 class ResearchAgent(BaseAgent):
@@ -23,19 +23,22 @@ Structure your output as:
 1. Market Overview (TAM/SAM/SOM estimates if possible)
 2. Competitor Landscape (table format)
 3. Key Trends (bullet points)
-4. Risks & Opportunities
-Keep it factual, concise, and actionable (400-600 words).
-"""
+4. Risks and Opportunities
+Keep it factual, concise, and actionable (400-600 words)."""
 
-    def run(self, objective: str, context: dict[str, str]) -> str:
-        ctx = self._build_context_block(context)
-        prompt = f"""Startup Objective: {objective}
+    def run(self, objective: str, context: dict[str, AgentResult]) -> AgentResult:
+        """
+        Execute the research agent task.
 
-{ctx}
+        Args:
+            objective: The top-level startup goal.
+            context:   Results from prior agents in the pipeline.
 
-Conduct market research for this startup now."""
-
-        self._log.info("research.running")
-        result = self._call_claude(prompt)
-        self._log.info("research.done")
-        return result
+        Returns:
+            AgentResult containing the research output.
+        """
+        self._log.info("research.run.start")
+        prompt = self._build_prompt(objective, context)
+        content = self._call_claude(prompt)
+        self._log.info("research.run.complete", content_chars=len(content))
+        return AgentResult(agent=self.name, content=content)

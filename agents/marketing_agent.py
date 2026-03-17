@@ -5,7 +5,7 @@ Crafts go-to-market strategy, messaging, and launch campaigns.
 
 from __future__ import annotations
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import AgentResult, BaseAgent
 
 
 class MarketingAgent(BaseAgent):
@@ -22,22 +22,25 @@ Your job is to:
 
 Structure your output as:
 1. Brand Positioning Statement
-2. Landing Page Copy (headline + sub-headline + CTA)
+2. Landing Page Copy (headline, sub-headline, CTA)
 3. GTM Strategy
 4. Top 3 Acquisition Channels (with tactics)
 5. Launch Week Plan (day-by-day)
-Be creative, punchy, and specific — no generic marketing fluff (400-500 words).
-"""
+Be creative, punchy, and specific (400-500 words)."""
 
-    def run(self, objective: str, context: dict[str, str]) -> str:
-        ctx = self._build_context_block(context)
-        prompt = f"""Startup Objective: {objective}
+    def run(self, objective: str, context: dict[str, AgentResult]) -> AgentResult:
+        """
+        Execute the marketing agent task.
 
-{ctx}
+        Args:
+            objective: The top-level startup goal.
+            context:   Results from prior agents in the pipeline.
 
-Write the marketing and GTM plan now."""
-
-        self._log.info("marketing.running")
-        result = self._call_claude(prompt)
-        self._log.info("marketing.done")
-        return result
+        Returns:
+            AgentResult containing the marketing output.
+        """
+        self._log.info("marketing.run.start")
+        prompt = self._build_prompt(objective, context)
+        content = self._call_claude(prompt)
+        self._log.info("marketing.run.complete", content_chars=len(content))
+        return AgentResult(agent=self.name, content=content)

@@ -5,7 +5,7 @@ Proposes system architecture, tech stack, and scaffolds starter code.
 
 from __future__ import annotations
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import AgentResult, BaseAgent
 
 
 class EngineerAgent(BaseAgent):
@@ -22,22 +22,25 @@ Your job is to:
 
 Structure your output as:
 1. Tech Stack (with reasoning)
-2. System Architecture (describe components and how they connect)
-3. Core Data Models (name + key fields)
+2. System Architecture (components and how they connect)
+3. Core Data Models (name and key fields)
 4. Project Structure (folder tree)
-5. Technical Risks & Mitigations
-Write clean, opinionated recommendations — no fence-sitting (400-600 words).
-"""
+5. Technical Risks and Mitigations
+Write clean, opinionated recommendations (400-600 words)."""
 
-    def run(self, objective: str, context: dict[str, str]) -> str:
-        ctx = self._build_context_block(context)
-        prompt = f"""Startup Objective: {objective}
+    def run(self, objective: str, context: dict[str, AgentResult]) -> AgentResult:
+        """
+        Execute the engineer agent task.
 
-{ctx}
+        Args:
+            objective: The top-level startup goal.
+            context:   Results from prior agents in the pipeline.
 
-Produce the technical architecture document now."""
-
-        self._log.info("engineer.running")
-        result = self._call_claude(prompt)
-        self._log.info("engineer.done")
-        return result
+        Returns:
+            AgentResult containing the engineer output.
+        """
+        self._log.info("engineer.run.start")
+        prompt = self._build_prompt(objective, context)
+        content = self._call_claude(prompt)
+        self._log.info("engineer.run.complete", content_chars=len(content))
+        return AgentResult(agent=self.name, content=content)

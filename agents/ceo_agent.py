@@ -1,11 +1,11 @@
 """
 agents/ceo_agent.py
-Sets the overall strategy, vision, and guiding principles for the startup.
+Sets overall strategy, vision, and guiding principles.
 """
 
 from __future__ import annotations
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import AgentResult, BaseAgent
 
 
 class CEOAgent(BaseAgent):
@@ -24,18 +24,21 @@ Output a concise strategy memo (300-500 words) with the following sections:
 2. Target Customer
 3. Core Value Proposition
 4. Top 3 Strategic Priorities
-5. Key Success Metrics
-"""
+5. Key Success Metrics"""
 
-    def run(self, objective: str, context: dict[str, str]) -> str:
-        ctx = self._build_context_block(context)
-        prompt = f"""Startup Objective: {objective}
+    def run(self, objective: str, context: dict[str, AgentResult]) -> AgentResult:
+        """
+        Execute the ceo agent task.
 
-{ctx}
+        Args:
+            objective: The top-level startup goal.
+            context:   Results from prior agents in the pipeline.
 
-Write the strategy memo now."""
-
-        self._log.info("ceo.running")
-        result = self._call_claude(prompt)
-        self._log.info("ceo.done")
-        return result
+        Returns:
+            AgentResult containing the ceo output.
+        """
+        self._log.info("ceo.run.start")
+        prompt = self._build_prompt(objective, context)
+        content = self._call_claude(prompt)
+        self._log.info("ceo.run.complete", content_chars=len(content))
+        return AgentResult(agent=self.name, content=content)
